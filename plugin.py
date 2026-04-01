@@ -54,7 +54,7 @@ class DocumentSegmenterPlugin(APlugin):
     # Action principale
     # ------------------------------------------------------------------
 
-    async def segment_documents(self, ctx: ActionContext, pourcentage: int = 3) -> ActionResult:
+    async def regrouper_en_documents(self, ctx: ActionContext, pourcentage: int = 3) -> ActionResult:
         instances = await self.project.get_instances(ids=ctx.instance_ids)
         instances_sorted = sorted(instances, key=lambda inst: inst.url or "")
 
@@ -85,11 +85,10 @@ class DocumentSegmenterPlugin(APlugin):
                           f"{len(instances_sorted)} images en {len(result_groups)} groupes.")]
         )
 
-    async def match_folders(self, ctx: ActionContext, vec_type: VectorType, input_folder: str, comparison_folder: str) -> ActionResult:
+    async def trouver_image_originale(self, ctx: ActionContext, vec_type: VectorType, root_folder: str, input_folder: str, comparison_folder: str) -> ActionResult:
         all_instances = await self.project.get_instances(ids=ctx.instance_ids)
-        root_path = "/home/ceres/Images/corpus/Zoé/"
-        input_path = root_path + input_folder
-        comparison_path = root_path + comparison_folder
+        input_path = root_folder + input_folder
+        comparison_path = root_folder + comparison_folder
 
         # Séparer les instances selon leur dossier
         input_instances = [i for i in all_instances if i.url and i.url.startswith(input_path)]
