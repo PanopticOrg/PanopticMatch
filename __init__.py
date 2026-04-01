@@ -1,0 +1,2 @@
+from .plugin import DocumentSegmenterPlugin
+plugin_class = DocumentSegmenterPlugin
