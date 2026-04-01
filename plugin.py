@@ -47,8 +47,8 @@ class DocumentSegmenterPlugin(APlugin):
         super().__init__(name=name, project=project, plugin_path=plugin_path)
         self.params: SegmenterParams = SegmenterParams()
 
-        self.add_action_easy(self.segment_documents, ["execute"])
-        self.add_action_easy(self.match_folders, ["execute"])
+        self.add_action_easy(self.regrouper_en_documents, ["execute"])
+        self.add_action_easy(self.trouver_image_originale, ["execute"])
 
     # ------------------------------------------------------------------
     # Action principale
