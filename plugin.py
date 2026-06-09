@@ -14,6 +14,7 @@ Contraintes strictes :
 """
 
 import os
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -87,12 +88,14 @@ class DocumentSegmenterPlugin(APlugin):
 
     async def trouver_image_originale(self, ctx: ActionContext, vec_type: VectorType, root_folder: str, input_folder: str, comparison_folder: str) -> ActionResult:
         all_instances = await self.project.get_instances(ids=ctx.instance_ids)
-        input_path = root_folder + input_folder
-        comparison_path = root_folder + comparison_folder
+        def _to_path(p: str) -> Path:
+            return Path(p.replace("\\", "/"))
 
-        # Séparer les instances selon leur dossier
-        input_instances = [i for i in all_instances if i.url and i.url.startswith(input_path)]
-        comparison_instances = [i for i in all_instances if i.url and i.url.startswith(comparison_path)]
+        input_path = _to_path(root_folder) / _to_path(input_folder)
+        comparison_path = _to_path(root_folder) / _to_path(comparison_folder)
+
+        input_instances = [i for i in all_instances if i.url and _to_path(i.url).is_relative_to(input_path)]
+        comparison_instances = [i for i in all_instances if i.url and _to_path(i.url).is_relative_to(comparison_path)]
 
         if not input_instances:
             return ActionResult(notifs=[Notif(NotifType.ERROR, "Dossier vide",
