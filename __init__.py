@@ -1,2 +1,2 @@
-from .plugin import DocumentSegmenterPlugin
-plugin_class = DocumentSegmenterPlugin
+from .plugin import ImageMatchPlugin
+plugin_class = ImageMatchPlugin

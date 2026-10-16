@@ -1,16 +1,8 @@
 """
-DocumentSegmenterPlugin
-=======================
-Segmente une séquence d'images numérisées (triées par filepath) en groupes
-cohérents ("documents"), en s'appuyant sur des vecteurs existants.
-
-Contraintes strictes :
-  - L'ordre des images EST respecté (pas de groupe "non-contigu")
-  - Chaque groupe comporte entre 1 et MAX_GROUP_SIZE images (défaut 10)
-  - Un algorithme de programmation dynamique minimise la dissimilarité
-    cosine intra-groupe sur la séquence ordonnée
-  - La propriété "group_number" (type number) est créée si absente,
-    puis renseignée pour chaque instance traitée
+ImageMatchPlugin
+================
+Pour chaque image d'un dossier, trouve l'image la plus similaire d'un autre dossier,
+en s'appuyant sur des vecteurs existants.
 """
 # No `from __future__ import annotations`: the action registry reads the real annotation classes.
 
@@ -18,83 +10,18 @@ import os
 from pathlib import Path
 
 import numpy as np
-from pydantic import BaseModel
 
-from panoptic.core.databases.data.models import InstanceValue, UpsertCommit
-from panoptic.core.databases.entity_schema import OP_UPDATE
 from panoptic.core.databases.media.models import VectorType
 from panoptic.core.plugin.plugin import APlugin
 from panoptic.models.action_models import (
     ActionContext, ActionResult, FolderPath, Group, Notif, NotifType, Score,
 )
-from panoptic.models.models import PropertyMode, PropertyType
 
 
-# ---------------------------------------------------------------------------
-# Paramètres configurables via l'UI Panoptic
-# ---------------------------------------------------------------------------
-
-class SegmenterParams(BaseModel):
-    max_group_size: int = 10
-
-
-# ---------------------------------------------------------------------------
-# Plugin principal
-# ---------------------------------------------------------------------------
-
-class DocumentSegmenterPlugin(APlugin):
-    """
-    Segmente des images numérisées ordonnées en groupes de documents cohérents.
-    """
-
+class ImageMatchPlugin(APlugin):
     def __init__(self, name: str, project, plugin_path: str):
-        self.params = SegmenterParams()
         super().__init__(name=name, project=project, plugin_path=plugin_path)
-
-        self.add_action_easy(self.regrouper_en_documents, ["execute"])
         self.add_action_easy(self.trouver_image_originale, ["execute"])
-
-    # ------------------------------------------------------------------
-    # Actions
-    # ------------------------------------------------------------------
-
-    def regrouper_en_documents(self, ctx: ActionContext, pourcentage: int = 3) -> ActionResult:
-        """Regroupe les images consécutives tant que leurs dimensions varient de moins de `pourcentage` %.
-        @pourcentage: variation maximale (en %) de largeur ou de hauteur entre deux images d'un même groupe
-        """
-        images = sorted(self._get_images(ctx), key=lambda img: img.path)
-        if not images:
-            return ActionResult(notifs=[Notif(NotifType.ERROR, "Aucune image", "Aucune image à segmenter.")])
-
-        group_assignments = _segment_by_dims(images, pourcentage / 100)
-
-        group_number_prop = self._get_or_create_group_number_property()
-        commit = UpsertCommit()
-        commit.instance_values[group_number_prop.id] = [
-            InstanceValue(
-                property_id=group_number_prop.id,
-                instance_id=images[idx].instance.id,
-                value=group_idx + 1,
-                commit_id=0,
-                operation=OP_UPDATE,
-            )
-            for group_idx, indices in enumerate(group_assignments)
-            for idx in indices
-        ]
-        self.project.apply_upsert_commit(commit)
-
-        result_groups = []
-        for group_idx, indices in enumerate(group_assignments):
-            ids = [images[i].instance.id for i in indices]
-            first_file = os.path.basename(images[indices[0]].path)
-            last_file = os.path.basename(images[indices[-1]].path)
-            result_groups.append(Group(ids=ids, name=f"Doc {group_idx + 1}  [{first_file} … {last_file}]"))
-
-        return ActionResult(
-            groups=result_groups,
-            notifs=[Notif(NotifType.INFO, "Segmentation terminée",
-                          f"{len(images)} images en {len(result_groups)} groupes.")]
-        )
 
     # Defaults are needed: an input left empty in the UI is not passed to the function.
     def trouver_image_originale(self, ctx: ActionContext, vec_type: VectorType = None,
@@ -178,12 +105,8 @@ class DocumentSegmenterPlugin(APlugin):
                           f"sur {len(input_images)} images d'entrée.")]
         )
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     def _get_images(self, ctx: ActionContext) -> list["_Image"]:
-        """Instances du contexte avec le chemin complet et les dimensions de leur fichier."""
+        """Instances du contexte avec le chemin complet de leur fichier."""
         if ctx.instance_ids:
             instances = self.project.get_instances(id=ctx.instance_ids)
         else:
@@ -201,52 +124,17 @@ class DocumentSegmenterPlugin(APlugin):
                 continue
             folder = folders.get(file.folder_id)
             path = os.path.join(folder.path, file.name) if folder and folder.path else file.name
-            images.append(_Image(inst, path, file.width, file.height))
+            images.append(_Image(inst, path))
         return images
-
-    def _get_or_create_group_number_property(self):
-        """
-        Retourne la propriété "group_number" (type number, mode instance).
-        La crée si elle n'existe pas encore.
-        """
-        prop_name = "group_number"
-        for prop in self.project.get_properties(name=prop_name):
-            if prop.mode == PropertyMode.id.value:
-                return prop
-        return self.project.add_property(prop_name, PropertyType.number.value, mode=PropertyMode.id.value)
 
 
 class _Image:
-    __slots__ = ("instance", "path", "width", "height")
+    __slots__ = ("instance", "path")
 
-    def __init__(self, instance, path: str, width: int | None, height: int | None):
+    def __init__(self, instance, path: str):
         self.instance = instance
         self.path = path
-        self.width = width
-        self.height = height
 
 
 def _to_path(p: str) -> Path:
     return Path(p.replace("\\", "/"))
-
-
-def _segment_by_dims(images, percentage: float = 0.03):
-    """Coupe la séquence en groupes dès qu'un changement de dimensions > 3% est détecté."""
-    groups = []
-    current = [0]
-
-    for i in range(1, len(images)):
-        prev = images[i - 1]
-        curr = images[i]
-
-        if prev.width and prev.height and curr.width and curr.height:
-            w_ratio = abs(prev.width - curr.width) / max(prev.width, curr.width)
-            h_ratio = abs(prev.height - curr.height) / max(prev.height, curr.height)
-            if w_ratio > percentage or h_ratio > percentage:
-                groups.append(current)
-                current = []
-
-        current.append(i)
-
-    groups.append(current)
-    return groups
