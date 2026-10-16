@@ -13,6 +13,6 @@ Sur la page d'accueil de Panoptic, ajoutez un plugin de type git avec l'url http
 Lancez `trouver_image_originale` depuis le bouton « exécuter » avec :
 
 - `vec_type` : type de vecteurs à utiliser ;
-- `input_folder` : dossier des images dont on cherche l'original (ex. `.../Flam/Nouvelles`) ;
-- `comparison_folder` : dossier où chercher les originaux (ex. `.../Flam/Anciennes`) ;
+- `input_folder` : images à apparier ;
+- `comparison_folder` : images candidates ;
 - `similarity_threshold` : similarité cosine minimale, `0.8` par défaut.
