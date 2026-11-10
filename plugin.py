@@ -1,12 +1,13 @@
 """
 ImageMatchPlugin
 ================
-Pour chaque image d'un dossier, trouve l'image la plus similaire d'un autre dossier,
-en s'appuyant sur des vecteurs existants.
+Pour chaque image d'un dossier, trouve l'image correspondante d'un autre dossier :
+les vecteurs existants présélectionnent les candidats, les points SIFT concordants décident.
 """
 # No `from __future__ import annotations`: the action registry reads the real annotation classes.
 
 import os
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,10 @@ from panoptic.core.plugin.plugin import APlugin
 from panoptic.models.action_models import (
     ActionContext, ActionResult, FolderPath, Group, Notif, NotifType, Score,
 )
+
+from .sift import FeatureStore
+
+SIFT_IMAGE_SIZE = 1024
 
 
 class ImageMatchPlugin(APlugin):
@@ -27,12 +32,18 @@ class ImageMatchPlugin(APlugin):
     def trouver_image_originale(self, ctx: ActionContext, vec_type: VectorType = None,
                                 input_folder: FolderPath = None,
                                 comparison_folder: FolderPath = None,
-                                similarity_threshold: float = 0.8) -> ActionResult:
-        """Pour chaque image du dossier d'entrée, trouve l'image la plus similaire du dossier de comparaison.
-        @vec_type: vecteurs utilisés pour calculer la similarité
+                                top_k: int = 100,
+                                min_inliers: int = 20,
+                                max_matches: int = 1,
+                                sift_nfeatures: int = 1000) -> ActionResult:
+        """Pour chaque image du dossier d'entrée, trouve l'image correspondante du dossier de comparaison.
+        @vec_type: vecteurs utilisés pour présélectionner les candidats
         @input_folder: dossier contenant les images dont on cherche l'original
         @comparison_folder: dossier dans lequel chercher les originaux
-        @similarity_threshold: similarité cosine minimale (entre 0 et 1) pour garder une paire
+        @top_k: nombre de candidats comparés par points SIFT pour chaque image d'entrée
+        @min_inliers: nombre minimal de points concordants pour garder une paire
+        @max_matches: nombre maximal de paires par image, par exemple 2 pour des doubles pages découpées en deux fichiers
+        @sift_nfeatures: nombre de points SIFT extraits par image
         """
         if vec_type is None or not input_folder or not comparison_folder:
             return ActionResult(notifs=[Notif(NotifType.ERROR, "Paramètres manquants",
@@ -77,33 +88,66 @@ class ImageMatchPlugin(APlugin):
         comparison_vecs = np.stack([vec_map[img.instance.sha1] for img in comparison_images])
         sims = input_vecs @ comparison_vecs.T
 
-        # Appariement glouton global : les paires les plus similaires sont attribuées en premier,
-        # chaque image ne pouvant appartenir qu'à une seule paire
-        rows, cols = np.nonzero(sims >= similarity_threshold)
-        order = np.argsort(-sims[rows, cols], kind="stable")
-        used_inputs, used_comparisons = set(), set()
-        groups = []
-        for k in order:
-            i, j = int(rows[k]), int(cols[k])
-            if i in used_inputs or j in used_comparisons:
-                continue
-            used_inputs.add(i)
-            used_comparisons.add(j)
-
-            inp, match = input_images[i], comparison_images[j]
-            sim = round(float(sims[i, j]) * 100, 1)
-            groups.append(Group(
-                ids=[inp.instance.id, match.instance.id],
-                name=f"{os.path.basename(inp.path)}  ↔  {os.path.basename(match.path)}",
-                score=Score(value=sim, min=0, max=100, max_is_best=True, description="Similarité cosine")
-            ))
+        groups = self._match_groups(input_images, comparison_images, input_vecs, comparison_vecs, sims,
+                                    top_k, min_inliers, max(1, max_matches), sift_nfeatures)
 
         return ActionResult(
             groups=groups,
             notifs=[Notif(NotifType.INFO, "Matching terminé",
-                          f"{len(groups)} paires trouvées (similarité >= {similarity_threshold}) "
+                          f"{len(groups)} correspondances trouvées (>= {min_inliers} points concordants) "
                           f"sur {len(input_images)} images d'entrée.")]
         )
+
+    def _match_groups(self, input_images, comparison_images, input_vecs, comparison_vecs, sims,
+                      top_k, min_inliers, max_matches, sift_nfeatures) -> list[Group]:
+        # Le centrage retire la composante commune au corpus (même type de document) pour classer les candidats
+        mean = np.concatenate([input_vecs, comparison_vecs]).mean(axis=0)
+        ranking = _normalize(input_vecs - mean) @ _normalize(comparison_vecs - mean).T
+        k = max(1, min(top_k, ranking.shape[1]))
+        cand = np.argpartition(-ranking, k - 1, axis=1)[:, :k]
+
+        pairs = [(i, int(j)) for i in range(len(input_images)) for j in cand[i]]
+
+        image_type = self._sift_image_type()
+        if image_type is None:
+            paths = {img.instance.sha1: img.path for img in input_images + comparison_images}
+            source, load = "file", lambda sha1s: {s: paths[s] for s in sha1s if s in paths}
+        else:
+            source, load = f"type{image_type}", lambda sha1s: self._load_image_bytes(image_type, sha1s)
+        store = FeatureStore(self.data_path / f"sift_{source}_{SIFT_IMAGE_SIZE}_{sift_nfeatures}",
+                             sift_nfeatures, SIFT_IMAGE_SIZE, load)
+        store.ensure([input_images[i].instance.sha1 for i, _ in pairs] +
+                     [comparison_images[j].instance.sha1 for _, j in pairs])
+        inliers = store.inliers([(input_images[i].instance.sha1, comparison_images[j].instance.sha1)
+                                 for i, j in pairs])
+
+        scored = sorted(((n, float(sims[i, j]), i, j) for n, (i, j) in zip(inliers, pairs) if n >= min_inliers),
+                        reverse=True)
+        # Appariement glouton : les paires les plus sûres d'abord, chaque image dans au plus max_matches paires
+        input_count, comparison_count, kept = Counter(), Counter(), []
+        for n, sim, i, j in scored:
+            if input_count[i] >= max_matches or comparison_count[j] >= max_matches:
+                continue
+            input_count[i] += 1
+            comparison_count[j] += 1
+            kept.append((n, i, j))
+        return _connected_groups(input_images, comparison_images, kept)
+
+    def _sift_image_type(self) -> int | None:
+        """Plus petit rendu stocké d'au moins SIFT_IMAGE_SIZE px, sinon None : les fichiers originaux sont lus."""
+        with self.project._media_db() as db:
+            types = db.get_image_types()
+        big_enough = [(max(t.width or 0, t.height or 0), t.id) for t in types
+                      if max(t.width or 0, t.height or 0) >= SIFT_IMAGE_SIZE]
+        return min(big_enough)[1] if big_enough else None
+
+    def _load_image_bytes(self, image_type: int, sha1s: list[str]) -> dict[str, bytes]:
+        data = {}
+        for start in range(0, len(sha1s), 200):
+            with self.project._media_db() as db:
+                for img in db.get_images(type_id=image_type, sha1=sha1s[start:start + 200]):
+                    data[img.sha1] = img.data
+        return data
 
     def _get_images(self, ctx: ActionContext) -> list["_Image"]:
         """Instances du contexte avec le chemin complet de leur fichier."""
@@ -126,6 +170,45 @@ class ImageMatchPlugin(APlugin):
             path = os.path.join(folder.path, file.name) if folder and folder.path else file.name
             images.append(_Image(inst, path))
         return images
+
+
+def _connected_groups(input_images, comparison_images, kept: list[tuple[int, int, int]]) -> list[Group]:
+    """Un groupe par ensemble de paires reliées : une image ne peut appartenir qu'à un seul groupe dans Panoptic.
+    Avec max_matches > 1, une double page et ses deux moitiés forment ainsi un seul groupe."""
+    parent: dict = {}
+
+    def find(x):
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for _, i, j in kept:
+        parent[find(("in", i))] = find(("cmp", j))
+    components: dict = {}
+    for n, i, j in kept:
+        components.setdefault(find(("in", i)), []).append((n, i, j))
+
+    best = max((n for n, _, _ in kept), default=0)
+    groups = []
+    for pairs in components.values():
+        inputs = list(dict.fromkeys(input_images[i] for _, i, _ in pairs))
+        matches = list(dict.fromkeys(comparison_images[j] for _, _, j in pairs))
+        weakest = min(n for n, _, _ in pairs)
+        groups.append(Group(
+            ids=[img.instance.id for img in inputs + matches],
+            name=f"{', '.join(os.path.basename(img.path) for img in inputs)}  ↔  "
+                 f"{', '.join(os.path.basename(img.path) for img in matches)}",
+            score=Score(value=weakest, min=0, max=best, max_is_best=True,
+                        description="Points SIFT concordants (paire la plus faible du groupe)")))
+    groups.sort(key=lambda g: -g.score.value)
+    return groups
+
+
+def _normalize(m: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(m, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return m / norms
 
 
 class _Image:
